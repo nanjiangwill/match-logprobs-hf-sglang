@@ -1,8 +1,10 @@
 # Reproduce HF/SGLang same logprobs
 
-download model with `hf download Qwen/Qwen3-0.6B --local-dir ./qwen-0.6b` 
-generate rollout: `python -m minimal_on_policy run_sglang qwen-0.6b qwen-0.6b_text.json 50 1 False`
-compare: `python -m minimal_on_policy run_hf_lenient_compare qwen-0.6b qwen-0.6b_text.json 0 qwen-0.6b_report.json`
+1. download model with `hf download Qwen/Qwen3-0.6B --local-dir ./qwen-0.6b` 
+
+2. generate rollout: `python -m minimal_on_policy run_sglang qwen-0.6b qwen-0.6b_text.json 50 1 False`
+
+3. compare: `python -m minimal_on_policy run_hf_lenient_compare qwen-0.6b qwen-0.6b_text.json 0 qwen-0.6b_report.json`
 
 ```bash
 ✓ Prompt 1: | logprob_diff: max=0.0000000000, min=0.0000000000, max_abs=0.0000000000, min_abs=0.0000000000, mean_abs=0.0000000000
