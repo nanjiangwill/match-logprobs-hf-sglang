@@ -1,4 +1,4 @@
-# Matching Token Logprobs Between HF and SGLang
+# Matching Logprobs Between HF and SGLang
 
 ### Version
 1. transformers: `4.57.1`
