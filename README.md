@@ -1,4 +1,6 @@
 # Reproduce HF/SGLang same logprobs
+transformers: 4.57.1
+sglang: 0.5.5
 
 1. download model with `hf download Qwen/Qwen3-0.6B --local-dir ./qwen-0.6b` 
 
