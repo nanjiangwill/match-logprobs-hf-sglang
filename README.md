@@ -15,6 +15,6 @@ sglang: 0.5.5
 ✓ Prompt 4: | logprob_diff: max=0.0000000000, min=0.0000000000, max_abs=0.0000000000, min_abs=0.0000000000, mean_abs=0.0000000000
 ```
 
-minimal script based on slime + sglang (true on policy)[https://github.com/THUDM/slime/tree/main/examples/true_on_policy]
+minimal script based on slime + sglang [true on policy](https://github.com/THUDM/slime/tree/main/examples/true_on_policy)
 
 same as https://gist.github.com/nanjiangwill/dda73f2ac66c8447b759111452b9fe0e
