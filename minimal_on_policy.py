@@ -3,56 +3,24 @@ import os
 import fire
 import sglang as sgl
 import torch
-import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-def _setup_env():
-    os.environ["NCCL_ALGO"] = "allreduce:tree"
-    os.environ["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
-    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-    os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
+# Setup environment
+os.environ["NCCL_ALGO"] = "allreduce:tree"
+os.environ["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
 
-def _setup_batch_invariant_mode():
-    from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
-    from transformers.models.qwen3 import modeling_qwen3
-    enable_batch_invariant_mode(enable_bmm=False)
-    modeling_qwen3.apply_rotary_pos_emb = torch.compile(dynamic=True)(modeling_qwen3.apply_rotary_pos_emb)
-    
-# def selective_log_softmax_raw(logits: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
-#     """Fused version of the common `log_softmax -> gather` operation.
-#     The fused version of this operation avoids the (potentially large) memory overhead
-#     of allocating a new tensor to store the full logprobs.
-#     Parameters:
-#         logits: Tensor of shape [..., V] containing model logits.
-#         input_ids: Tensor of shape [...] of token indices whose log-probabilities are gathered.
-#     Returns:
-#         Tensor of shape [...] containing the log-probabilities corresponding to `input_ids`.
-#     """
-#     # Compute log(sum(exp(logits))) for normalization
-#     log_sum_exp = torch.logsumexp(logits, dim=-1, keepdim=True)
-    
-#     # Get the logits for the selected tokens
-#     selected_logits = torch.gather(logits, dim=-1, index=input_ids.unsqueeze(-1)).squeeze(-1)
-    
-#     # Compute log probabilities as: selected_logit - log(sum(exp(all_logits)))
-#     return selected_logits - log_sum_exp.squeeze(-1)
+# Setup batch invariant mode
+from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
+from transformers.models.qwen3 import modeling_qwen3
+enable_batch_invariant_mode(enable_bmm=False)
+modeling_qwen3.apply_rotary_pos_emb = torch.compile(dynamic=True)(modeling_qwen3.apply_rotary_pos_emb)
 
-def selective_log_softmax_raw(logits: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
-    """Fused version of the common `log_softmax -> gather` operation.
-    The fused version of this operation avoids the (potentially large) memory overhead
-    of allocating a new tensor to store the full logprobs.
-    Parameters:
-        logits: Tensor of shape [..., V] containing model logits.
-        input_ids: Tensor of shape [...] of token indices whose log-probabilities are gathered.
-    Returns:
-        Tensor of shape [...] containing the log-probabilities corresponding to `input_ids`.
-    """
+def selective_log_softmax(logits: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+    """Get log probabilities for specific token indices."""
     logprobs = logits.log_softmax(dim=-1)
     return torch.gather(logprobs, dim=-1, index=input_ids.unsqueeze(-1)).squeeze(-1)
-
-_setup_env()
-_setup_batch_invariant_mode()
-selective_log_softmax_compiled = torch.compile(dynamic=True)(selective_log_softmax_raw)
 
 PROMPTS = [
     "The capital of France is",
@@ -70,9 +38,9 @@ PROMPTS_ADVANCED = [
     # Creative with continuation prefix/suffix
     "Story prompt: The last lighthouse on the island blinked for the final time as the storm rolled in. Continue the story:",
     "Poem prompt: Write a haiku about autumn rivers and drifting leaves. Continue:",
-    "Creative writing: Begin a sci-fi microstory with “When the stars started whispering,” and continue for 4-6 sentences:",
+    "Creative writing: Begin a sci-fi microstory with "When the stars started whispering," and continue for 4-6 sentences:",
     "Fantasy worldbuilding seed: In a city where memories are traded like coins, describe a typical marketplace scene. Continue:",
-    # Instruction-following with explicit “Assistant:” cue
+    # Instruction-following with explicit "Assistant:" cue
     "User: List five practical tips for avoiding overfitting when training neural networks. Assistant:",
     "User: Provide a Python function that returns the prime factors of an integer n, with a short explanation after the code. Assistant:",
     "User: Translate into Spanish (informal tone): 'Please text me when you arrive; I'll be waiting by the cafe.' Assistant:",
@@ -93,64 +61,61 @@ PROMPTS_ADVANCED = [
     "Explain like I'm 10: What is an API, and why do apps use them? Answer:",
 ]
 
-def _load_sglang_model(ckpt_path: str, use_cuda_graphs: bool, tp_size: int):
-    return sgl.Engine(
-        model_path=ckpt_path,
+def run_sglang(checkpoint_path: str, output_path: str, max_tokens: int = 10, tp_size: int = 1, use_advanced_prompts: bool = False):
+    """Generate text with SGLang and save logprobs."""
+    tok = AutoTokenizer.from_pretrained(checkpoint_path, trust_remote_code=True)
+    if tp_size != 1:
+        print("WARNING: tp_size != 1 detected. Logprobs will be incorrect.")
+    model = sgl.Engine(
+        model_path=checkpoint_path,
         tp_size=tp_size,
-        disable_cuda_graph=not use_cuda_graphs,
+        disable_cuda_graph=False,
         mem_fraction_static=0.7,
+        enable_memory_saver=True,
         attention_backend="fa3",
+        # Core on-policy parameters
         rl_on_policy_target="fsdp",
         enable_deterministic_inference=True,
-        enable_memory_saver=True,
     )
 
-def run_sglang_inference(
-    checkpoint_path: str, output_path: str, max_tokens: int = 10, tp_size: int = 1, use_advanced_prompts: bool = False
-):
-    tok = AutoTokenizer.from_pretrained(checkpoint_path, trust_remote_code=True)
-    model = _load_sglang_model(ckpt_path=checkpoint_path, use_cuda_graphs=True, tp_size=tp_size)
-
-    sampling_params = {
-        "temperature": 1.0,
-        "max_new_tokens": max_tokens,
-        "top_p": 1.0,
-        "top_k": -1,
-        "sampling_seed": 42,
-    }
-
-    prompts = PROMPTS + (PROMPTS_ADVANCED if use_advanced_prompts else [])
     results = []
-
-    for prompt in tqdm.tqdm(prompts, desc="Running inference"):
+    prompts = PROMPTS + (PROMPTS_ADVANCED if use_advanced_prompts else [])
+    for prompt in prompts:
         input_ids = tok(prompt, return_tensors="pt")["input_ids"].tolist()
-        outs = model.generate(input_ids=input_ids, sampling_params=sampling_params, return_logprob=True)
-        out = outs[0]
+        out = model.generate(
+            input_ids=input_ids,
+            sampling_params={
+                "temperature": 1.0,
+                "max_new_tokens": max_tokens,
+                "top_p": 1.0,
+                "top_k": -1,
+                "sampling_seed": 42,
+            },
+            return_logprob=True,
+        )[0]
 
         output_logprobs = out["meta_info"]["output_token_logprobs"]
-        token_ids = [t[1] for t in output_logprobs]
-        
         results.append({
             "prompt": prompt,
             "output_text": prompt + out["text"],
-            "tokens": [tok.decode([tid]) for tid in token_ids],
-            "token_ids": token_ids,
+            "tokens": [tok.decode([t[1]]) for t in output_logprobs],
+            "token_ids": [t[1] for t in output_logprobs],
             "logprobs": [float(t[0]) for t in output_logprobs],
         })
 
     with open(output_path, "w") as f:
         json.dump({"checkpoint_path": checkpoint_path, "results": results}, f, indent=2)
-
     print(f"Saved {len(results)} generations to {output_path}")
 
-def run_hf_lenient_compare(checkpoint_path: str, other_path: str, threshold: int, output_path: str | None = None):
+def run_hf_lenient_compare(checkpoint_path: str, other_path: str, output_path: str | None = None):
+    """Compare HuggingFace logprobs against SGLang results."""
     with open(other_path) as f:
         other_results = json.load(f)["results"]
 
     tok = AutoTokenizer.from_pretrained(checkpoint_path, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
-        checkpoint_path, 
-        trust_remote_code=True, 
+        checkpoint_path,
+        trust_remote_code=True,
         attn_implementation="flash_attention_3"
     ).cuda().eval()
 
@@ -160,81 +125,41 @@ def run_hf_lenient_compare(checkpoint_path: str, other_path: str, threshold: int
 
     for i, other_res in enumerate(other_results, start=1):
         prompt = other_res["prompt"]
-        other_token_ids = other_res.get("token_ids")
-        other_logprobs = other_res.get("logprobs")
-        other_logprobs = torch.tensor(other_logprobs, device=device)
-        lp_diffs, abs_lp_diffs = [], []
+        other_token_ids = other_res["token_ids"]
+        other_logprobs = torch.tensor(other_res["logprobs"], device=device)
 
         with torch.inference_mode():
-            # Build the full sequence: prompt + generated tokens
             prompt_ids = tok(prompt, return_tensors="pt")["input_ids"][0].tolist()
-            full_ids = prompt_ids + other_token_ids
+            full_ids = torch.tensor([prompt_ids + other_token_ids], device=device)
             
-            # Single forward pass to get all logits
-            input_ids = torch.tensor([full_ids], device=device)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                logits = model(input_ids=input_ids).logits[0]  # shape: [seq_len, vocab_size]
-
-            pred_logits = logits[len(prompt_ids)-1:-1]  # shape: [len(other_token_ids), vocab_size]
-            target_ids = torch.tensor(other_token_ids, device=device)
-            # Use selective_log_softmax to efficiently get log probs for targets
-            hf_logprobs = selective_log_softmax_raw(pred_logits, target_ids)
-
-            # Calculate logprob differences
-            if other_logprobs is not None:
-                for t, hf_lp in enumerate(hf_logprobs):
-                    if t < len(other_logprobs):
-                        diff = hf_lp.item() - other_logprobs[t].item()
-                        lp_diffs.append(diff)
-                        abs_lp_diffs.append(abs(diff))
-
-        max_abs_lp = max(abs_lp_diffs) if abs_lp_diffs else 0.0
-        min_abs_lp = min(abs_lp_diffs) if abs_lp_diffs else 0.0
-        max_lp = max(lp_diffs) if lp_diffs else 0.0
-        min_lp = min(lp_diffs) if lp_diffs else 0.0
-        mean_abs_lp = sum(abs_lp_diffs) / len(abs_lp_diffs) if abs_lp_diffs else 0.0
-        
-        if max_abs_lp > threshold:
-            failures += 1
-            status = "✗"
-        else:
-            status = "✓"
+                logits = model(input_ids=full_ids).logits[0, len(prompt_ids)-1:-1]
             
-        print(f"{status} Prompt {i}: | "
-              f"logprob_diff: max={max_lp:.10f}, min={min_lp:.10f}, "
-              f"max_abs={max_abs_lp:.10f}, min_abs={min_abs_lp:.10f}, mean_abs={mean_abs_lp:.10f}")
+            hf_logprobs = selective_log_softmax(logits, torch.tensor(other_token_ids, device=device))
+            diffs = (hf_logprobs - other_logprobs).tolist()
+            abs_diffs = [abs(d) for d in diffs]
 
+        max_abs = max(abs_diffs)
+        status = "✗" if max_abs > 0 else "✓"
+        failures += (max_abs > 0)
+        
+        print(f"{status} Prompt {i}: max_abs_diff={max_abs:.10f}, mean_abs_diff={sum(abs_diffs)/len(abs_diffs):.10f}")
+        
         summaries.append({
             "prompt": prompt,
-            "logprob_diffs": lp_diffs,
-            "max_logprob_diff": max_lp,
-            "min_logprob_diff": min_lp,
-            "max_abs_logprob_diff": max_abs_lp,
-            "min_abs_logprob_diff": min_abs_lp,
-            "mean_abs_logprob_diff": mean_abs_lp,
+            "max_abs_logprob_diff": max_abs,
+            "mean_abs_logprob_diff": sum(abs_diffs) / len(abs_diffs),
         })
 
-    all_lp_diffs = [d for s in summaries for d in s.get("logprob_diffs", [])]
-    all_abs_diffs = [abs(d) for d in all_lp_diffs]
-    overall_max_lp = max(all_lp_diffs) if all_lp_diffs else 0.0
-    overall_min_lp = min(all_lp_diffs) if all_lp_diffs else 0.0
-    overall_max_abs_lp = max(all_abs_diffs) if all_abs_diffs else 0.0
-    overall_min_abs_lp = min(all_abs_diffs) if all_abs_diffs else 0.0
-    overall_mean_abs_lp = sum(all_abs_diffs) / len(all_abs_diffs) if all_abs_diffs else 0.0
-    
-    print(f"\nOverall: failures={failures}")
-    print(f"Logprob diff: max={overall_max_lp:.10f}, min={overall_min_lp:.10f}")
-    print(f"Logprob |diff|: max={overall_max_abs_lp:.10f}, min={overall_min_abs_lp:.10f}, mean={overall_mean_abs_lp:.10f}")
+    all_diffs = [d for s in summaries for d in [s["max_abs_logprob_diff"]]]
+    print(f"\nOverall: {failures} failures, max_abs_diff={max(all_diffs):.10f}")
 
     if output_path:
         with open(output_path, "w") as f:
             json.dump({"checkpoint_path": checkpoint_path, "prompts": summaries}, f, indent=2)
 
-
 if __name__ == "__main__":
-    fire.Fire(
-        {
-            "run_sglang": run_sglang_inference,
-            "run_hf_lenient_compare": run_hf_lenient_compare,
-        }
-    )
+    fire.Fire({
+        "run_sglang": run_sglang,
+        "run_hf_lenient_compare": run_hf_lenient_compare,
+    })
