@@ -38,9 +38,9 @@ PROMPTS_ADVANCED = [
     # Creative with continuation prefix/suffix
     "Story prompt: The last lighthouse on the island blinked for the final time as the storm rolled in. Continue the story:",
     "Poem prompt: Write a haiku about autumn rivers and drifting leaves. Continue:",
-    "Creative writing: Begin a sci-fi microstory with "When the stars started whispering," and continue for 4-6 sentences:",
+    "Creative writing: Begin a sci-fi microstory with “When the stars started whispering,” and continue for 4-6 sentences:",
     "Fantasy worldbuilding seed: In a city where memories are traded like coins, describe a typical marketplace scene. Continue:",
-    # Instruction-following with explicit "Assistant:" cue
+    # Instruction-following with explicit “Assistant:” cue
     "User: List five practical tips for avoiding overfitting when training neural networks. Assistant:",
     "User: Provide a Python function that returns the prime factors of an integer n, with a short explanation after the code. Assistant:",
     "User: Translate into Spanish (informal tone): 'Please text me when you arrive; I'll be waiting by the cafe.' Assistant:",
