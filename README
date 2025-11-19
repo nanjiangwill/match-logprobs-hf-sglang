@@ -1,0 +1,14 @@
+# Reproduce HF/SGLang same logprobs
+
+download model with `hf download Qwen/Qwen3-0.6B --local-dir ./qwen-0.6b` 
+generate rollout: `python -m minimal_on_policy run_sglang qwen-0.6b qwen-0.6b_text.json 50 1 False`
+compare: `python -m minimal_on_policy run_hf_lenient_compare qwen-0.6b qwen-0.6b_text.json 0 qwen-0.6b_report.json`
+
+```bash
+✓ Prompt 1: | logprob_diff: max=0.0000000000, min=0.0000000000, max_abs=0.0000000000, min_abs=0.0000000000, mean_abs=0.0000000000
+✓ Prompt 2: | logprob_diff: max=0.0000000000, min=0.0000000000, max_abs=0.0000000000, min_abs=0.0000000000, mean_abs=0.0000000000
+✓ Prompt 3: | logprob_diff: max=0.0000000000, min=0.0000000000, max_abs=0.0000000000, min_abs=0.0000000000, mean_abs=0.0000000000
+✓ Prompt 4: | logprob_diff: max=0.0000000000, min=0.0000000000, max_abs=0.0000000000, min_abs=0.0000000000, mean_abs=0.0000000000
+```
+
+minimal script based on slime + sglang (true on policy)[https://github.com/THUDM/slime/tree/main/examples/true_on_policy]
