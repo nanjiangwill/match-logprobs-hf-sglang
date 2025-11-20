@@ -6,6 +6,18 @@ import torch
 import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+import torch.nn as nn
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import Replicate, Shard
+from torch.distributed.tensor.parallel import (
+    ColwiseParallel,
+    parallelize_module,
+    PrepareModuleInput,
+    RowwiseParallel,
+    SequenceParallel,
+)
+
+
 def _setup_env():
     os.environ["NCCL_ALGO"] = "allreduce:tree"
     os.environ["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
@@ -231,10 +243,215 @@ def run_hf_lenient_compare(checkpoint_path: str, other_path: str, threshold: int
             json.dump({"checkpoint_path": checkpoint_path, "prompts": summaries}, f, indent=2)
 
 
+def apply_non_moe_tp_transformers(
+    model: nn.Module,
+    tp_mesh: DeviceMesh,
+    loss_parallel: bool,
+):
+    """Apply tensor parallelism."""
+    # 1. Parallelize the embedding and shard its outputs (which are the first
+    # transformer block's inputs)
+    # 2. Parallelize the root norm layer over the sequence dim
+    # 3. Parallelize the final linear output layer
+    parallelize_module(
+        model,
+        tp_mesh,
+        {
+            "lm_head": ColwiseParallel(
+                input_layouts=Shard(1),
+                output_layouts=Shard(-1) if loss_parallel else Replicate(),
+                use_local_output=not loss_parallel,
+            ),
+        }
+    )
+    parallelize_module(
+        model.model,
+        tp_mesh,
+        {
+            "embed_tokens": RowwiseParallel(
+                input_layouts=Replicate(),
+                # output_layouts=Shard(1),
+            ),
+            # "norm": SequenceParallel(),
+        },
+    )
+
+    # Parallel styles used for transformer block linear weights and their
+    # inputs may be different for float8 linears with tensorwise scaling.
+    rowwise_parallel, colwise_parallel, prepare_module_input = (
+        RowwiseParallel,
+        ColwiseParallel,
+        PrepareModuleInput,
+    )
+
+    # Apply tensor + sequence parallelism to every transformer block
+    # NOTE: At the cost of model code change, we can accelerate Sequence Parallel
+    #       by folding (and unfolding) the batch dimension and the sequence dimension.
+    #       Examples can be found at https://github.com/pytorch/torchtitan/pull/437
+    for decode_layer in model.model.layers:
+        layer_plan = {
+            # "input_layernorm": SequenceParallel(),
+            # "self_attn": prepare_module_input(
+            #     input_layouts=(Shard(1), Replicate(), None),
+            #     desired_input_layouts=(Replicate(), Replicate(), None),
+            # ),
+            "self_attn.q_proj": colwise_parallel(),
+            "self_attn.k_proj": colwise_parallel(),
+            "self_attn.v_proj": colwise_parallel(),
+            # "attention.q_norm": SequenceParallel(sequence_dim=2),
+            # "attention.k_norm": SequenceParallel(sequence_dim=2),
+            # "self_attn.o_proj": rowwise_parallel(output_layouts=Shard(1)),
+            "self_attn.o_proj": rowwise_parallel(),
+            # "post_attention_layernorm": SequenceParallel(),
+        }
+
+        layer_plan.update(
+            {
+                # "mlp": prepare_module_input(
+                #     input_layouts=(Shard(1),),
+                #     desired_input_layouts=(Replicate(),),
+                # ),
+                "mlp.gate_proj": colwise_parallel(),
+                # "mlp.down_proj": rowwise_parallel(output_layouts=Shard(1)),
+                "mlp.down_proj": rowwise_parallel(),
+                "mlp.up_proj": colwise_parallel(),
+            }
+        )
+
+        parallelize_module(
+            module=decode_layer,
+            device_mesh=tp_mesh,
+            parallelize_plan=layer_plan,
+        )
+
+
+def run_fsdp2_lenient_compare(checkpoint_path: str, other_path: str, threshold: int, output_path: str | None = None, tp_size: int = 2, dp_size: int = 4):
+    from torch.distributed.fsdp import (
+        fully_shard,
+    )
+    from torch.distributed.device_mesh import init_device_mesh
+    
+    try:
+        torch.distributed.init_process_group("nccl")
+        mesh = init_device_mesh("cuda", mesh_shape=(dp_size, tp_size), mesh_dim_names=("dp", "tp"))
+        tp_mesh = mesh["tp"]
+        dp_mesh = mesh["dp"]
+
+        local_rank = torch.distributed.get_rank()
+        torch.cuda.set_device(local_rank)
+
+        with open(other_path) as f:
+            other_results = json.load(f)["results"]
+
+        tok = AutoTokenizer.from_pretrained(checkpoint_path, trust_remote_code=True)
+
+        model = AutoModelForCausalLM.from_pretrained(
+            checkpoint_path, 
+            trust_remote_code=True,
+            attn_implementation="flash_attention_3",
+        )
+
+        apply_non_moe_tp_transformers(model, tp_mesh, loss_parallel=False)
+
+        modules = [
+            module
+            for name, module in model.named_modules()
+            if module.__class__.__name__ in model._no_split_modules
+            or (isinstance(module, torch.nn.Embedding) and not model.config.tie_word_embeddings)
+        ]
+
+        for idx, module in enumerate(modules):
+            fully_shard(module, mesh=dp_mesh)
+        model = fully_shard(model, mesh=dp_mesh)
+
+        device = torch.cuda.current_device()
+
+        summaries = []
+        failures = 0
+
+        for i, other_res in enumerate(other_results, start=1):
+            prompt = other_res["prompt"]
+            other_token_ids = other_res.get("token_ids")
+            other_logprobs = other_res.get("logprobs")
+            other_logprobs = torch.tensor(other_logprobs, device=device)
+            lp_diffs, abs_lp_diffs = [], []
+
+            with torch.inference_mode():
+                # Build the full sequence: prompt + generated tokens
+                prompt_ids = tok(prompt, return_tensors="pt")["input_ids"][0].tolist()
+                full_ids = prompt_ids + other_token_ids
+                
+                # Single forward pass to get all logits
+                input_ids = torch.tensor([full_ids], device=device)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    logits = model(input_ids=input_ids).logits[0]  # shape: [seq_len, vocab_size]
+
+                pred_logits = logits[len(prompt_ids)-1:-1]  # shape: [len(other_token_ids), vocab_size]
+                # torch.distributed.breakpoint()
+                target_ids = torch.tensor(other_token_ids, device=device)
+                # Use selective_log_softmax to efficiently get log probs for targets
+                hf_logprobs = selective_log_softmax_raw(pred_logits, target_ids)
+
+                # Calculate logprob differences
+                if other_logprobs is not None:
+                    for t, hf_lp in enumerate(hf_logprobs):
+                        if t < len(other_logprobs):
+                            diff = hf_lp.item() - other_logprobs[t].item()
+                            lp_diffs.append(diff)
+                            abs_lp_diffs.append(abs(diff))
+
+            if torch.distributed.get_rank() == 0:
+                max_abs_lp = max(abs_lp_diffs) if abs_lp_diffs else 0.0
+                min_abs_lp = min(abs_lp_diffs) if abs_lp_diffs else 0.0
+                max_lp = max(lp_diffs) if lp_diffs else 0.0
+                min_lp = min(lp_diffs) if lp_diffs else 0.0
+                mean_abs_lp = sum(abs_lp_diffs) / len(abs_lp_diffs) if abs_lp_diffs else 0.0
+                
+                if max_abs_lp > threshold:
+                    failures += 1
+                    status = "✗"
+                else:
+                    status = "✓"
+                    
+                print(f"{status} Prompt {i}: | "
+                    f"logprob_diff: max={max_lp:.10f}, min={min_lp:.10f}, "
+                    f"max_abs={max_abs_lp:.10f}, min_abs={min_abs_lp:.10f}, mean_abs={mean_abs_lp:.10f}")
+
+                summaries.append({
+                    "prompt": prompt,
+                    "logprob_diffs": lp_diffs,
+                    "max_logprob_diff": max_lp,
+                    "min_logprob_diff": min_lp,
+                    "max_abs_logprob_diff": max_abs_lp,
+                    "min_abs_logprob_diff": min_abs_lp,
+                    "mean_abs_logprob_diff": mean_abs_lp,
+                })
+
+        if torch.distributed.get_rank() == 0:
+            all_lp_diffs = [d for s in summaries for d in s.get("logprob_diffs", [])]
+            all_abs_diffs = [abs(d) for d in all_lp_diffs]
+            overall_max_lp = max(all_lp_diffs) if all_lp_diffs else 0.0
+            overall_min_lp = min(all_lp_diffs) if all_lp_diffs else 0.0
+            overall_max_abs_lp = max(all_abs_diffs) if all_abs_diffs else 0.0
+            overall_min_abs_lp = min(all_abs_diffs) if all_abs_diffs else 0.0
+            overall_mean_abs_lp = sum(all_abs_diffs) / len(all_abs_diffs) if all_abs_diffs else 0.0
+            
+            print(f"\nOverall: failures={failures}")
+            print(f"Logprob diff: max={overall_max_lp:.10f}, min={overall_min_lp:.10f}")
+            print(f"Logprob |diff|: max={overall_max_abs_lp:.10f}, min={overall_min_abs_lp:.10f}, mean={overall_mean_abs_lp:.10f}")
+
+            if output_path:
+                with open(output_path, "w") as f:
+                    json.dump({"checkpoint_path": checkpoint_path, "prompts": summaries}, f, indent=2)
+    finally:
+        torch.distributed.destroy_process_group()
+
+
 if __name__ == "__main__":
     fire.Fire(
         {
             "run_sglang": run_sglang_inference,
             "run_hf_lenient_compare": run_hf_lenient_compare,
+            "run_fsdp2_lenient_compare": run_fsdp2_lenient_compare,
         }
     )
